@@ -19,20 +19,15 @@ Config (AstrBot plugin config):
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from astrbot.core.star.filter.permission import PermissionType
-import astrbot.api.message_components as Comp
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter, MessageChain
-from astrbot.api.star import Context, Star, register
-from astrbot.core.star.config import put_config
-import asyncio, random
+from astrbot.api.star import Context, Star
+import asyncio
+import random
 
 from .skland_api import SklandAPI
 
-PLUGIN_NAME = "astrbot_plugin_skland"
 
-
-@register(PLUGIN_NAME, "AstrBot", "森空岛自动签到插件", "1.4.0")
 class SklandPlugin(Star):
     """森空岛签到插件"""
 
@@ -41,51 +36,13 @@ class SklandPlugin(Star):
         self.config = config
         self.api = SklandAPI(max_retries=3)
         self.scheduler = AsyncIOScheduler()
-        self._init_config()
 
-    def _init_config(self):
-        """注册后台配置项"""
-        put_config(
-            namespace=PLUGIN_NAME,
-            name="自动签到开关",
-            key="auto_sign_enabled",
-            value=True,
-            description="开启后，将在指定时间自动为所有已注册用户签到，并私发结果"
-        )
-        put_config(
-            namespace=PLUGIN_NAME,
-            name="自动签到时间（小时）",
-            key="auto_sign_hour",
-            value=1,
-            description="自动签到执行的小时（0-23），默认凌晨1点"
-        )
-        put_config(
-            namespace=PLUGIN_NAME,
-            name="显示玩家名称",
-            key="show_player_name",
-            value=True,
-            description="开启后，将在签到结果中显示森空岛昵称，否则显示QQ昵称"
-        )
-        put_config(
-            namespace=PLUGIN_NAME,
-            name="自动签到的延迟",
-            key="auto_sign_delay",
-            value=10,
-            description="开启后，将在签到时进行向后随机延迟（随机范围 0 至 设定的秒数）"
-        )
-        put_config(
-            namespace=PLUGIN_NAME,
-            name="最大用户数",
-            key="max_users",
-            value=10,
-            description="允许绑定的最大用户数量，0表示无限制"
-        )
 
     def _get_config(self) -> dict:
         """获取当前配置"""
         return {
-            "auto_sign_enabled": self.config.get("auto_sign_enabled", True),
-            "auto_sign_hour": self.config.get("auto_sign_hour", 1),
+            "auto_sign_enabled": self.config.get("auto_sign_enabled", False),
+            "auto_sign_hour": self.config.get("auto_sign_hour", 9),
             "show_player_name": self.config.get("show_player_name", True),
             "auto_sign_delay": self.config.get("auto_sign_delay", 10),
             "max_users": self.config.get("max_users", 10),
@@ -96,7 +53,7 @@ class SklandPlugin(Star):
         logger.info("森空岛签到插件已加载")
         config = self._get_config()
         if config.get("auto_sign_enabled", False):
-            hour = config.get("auto_sign_hour", 1)
+            hour = config.get("auto_sign_hour", 9)
             self._start_auto_sign_job(hour)
         if not self.scheduler.running:
             self.scheduler.start()
@@ -110,7 +67,7 @@ class SklandPlugin(Star):
 
     # ==================== Auto Sign-In ====================
 
-    def _start_auto_sign_job(self, hour: int = 1):
+    def _start_auto_sign_job(self, hour: int = 9):
         """启动自动签到定时任务"""
         hour = max(0, min(23, hour))
         trigger = CronTrigger(hour=hour, minute=0)
@@ -144,14 +101,14 @@ class SklandPlugin(Star):
         max_delay = config.get("auto_sign_delay", 10)
 
         for user_id, user_data in users.items():
-            # 随机延时的核心代码
+            if "token" not in user_data:
+                continue
+
+            # 随机延时防风控
             if max_delay > 0:
                 delay = random.uniform(0, max_delay)
                 logger.info(f"处理下一个用户前等待 {delay:.2f} 秒")
                 await asyncio.sleep(delay)
-            
-            if "token" not in user_data:
-                continue
 
             try:
                 token = user_data["token"]
@@ -160,9 +117,9 @@ class SklandPlugin(Star):
                 # 更新签到状态
                 for r in results:
                     if r.game == "明日方舟" and self._is_signed_today(r):
-                        user_data.setdefault("last_sign", {})["arknights"] = datetime.now().strftime("%Y-%m-%d")
+                        self._mark_signed(user_data, "arknights")
                     elif r.game == "终末地" and self._is_signed_today(r):
-                        user_data.setdefault("last_sign", {})["endfield"] = datetime.now().strftime("%Y-%m-%d")
+                        self._mark_signed(user_data, "endfield")
 
                 # 构建消息
                 message = f"🎮 森空岛自动签到结果\n\n{self._format_sign_status(results, nickname)}"
@@ -199,6 +156,15 @@ class SklandPlugin(Star):
         error = result.error.lower() if result.error else ""
         return any(k in error for k in ["已签到", "请勿重复", "重复签到", "already", "签到过", "今日已"])
 
+
+    @staticmethod
+    def _signed_today(user_data: dict, game: str) -> bool:
+        """last_sign 存日期，等于今天才算已签"""
+        return user_data.get("last_sign", {}).get(game) == datetime.now().strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _mark_signed(user_data: dict, game: str) -> None:
+        user_data.setdefault("last_sign", {})[game] = datetime.now().strftime("%Y-%m-%d")
     def _format_sign_status(self, results: list, nickname: str = "") -> str:
         if not results:
             return "没有绑定游戏"
@@ -270,9 +236,9 @@ class SklandPlugin(Star):
             }
             for r in results:
                 if r.game == "明日方舟" and self._is_signed_today(r):
-                    user_data["last_sign"]["arknights"] = datetime.now().strftime("%Y-%m-%d")
+                    self._mark_signed(user_data, "arknights")
                 elif r.game == "终末地" and self._is_signed_today(r):
-                    user_data["last_sign"]["endfield"] = datetime.now().strftime("%Y-%m-%d")
+                    self._mark_signed(user_data, "endfield")
             await self.put_kv_data("users", {**(await self.get_kv_data("users", {})), user_id: user_data})
             yield event.plain_result(f"登录成功！\n{self._format_sign_status(results, nickname)}")
         except Exception as e:
@@ -313,10 +279,10 @@ class SklandPlugin(Star):
                 group_name = group_id  # 这里可以尝试获取群名称，如果可能的话
                 group_stats.append(f"  • 群 {group_name}: {len(user_ids)} 人")
         
-        # 计算在线用户（最近7天有登录的用户）
+        # 今日已签用户（任一游戏）
         online_users = 0
         for user_data in users.values():
-            if user_data.get("last_sign"):
+            if self._signed_today(user_data, "arknights") or self._signed_today(user_data, "endfield"):
                 online_users += 1
         
         # 构建统计信息
@@ -349,9 +315,9 @@ class SklandPlugin(Star):
                         last_sign = list(user_data.get("last_sign", {}).values())[-1] if user_data.get("last_sign") else "未签到"
                         lines.append(f"  • {nickname} (最后签到: {last_sign})")
                 else:
-                    lines.append(f"\n💡 用户数过多，不显示详细列表")
+                    lines.append("\n💡 用户数过多，不显示详细列表")
             else:
-                lines.append(f"\n💡 如需查看详细用户列表请私信")
+                lines.append("\n💡 如需查看详细用户列表请私信")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("skd")
@@ -379,32 +345,35 @@ class SklandPlugin(Star):
                 user_data = users_data.get(uid)
                 if not user_data:
                     continue
+                if self._signed_today(user_data, "arknights") and self._signed_today(user_data, "endfield"):
+                    nickname = user_data.get("nickname") or user_data.get("last_username") or "(未知)"
+                    message_lines.append(f" ✅ | ✅ | {nickname}")
+                    continue
                 try:
                     results, nickname = await self.api.do_full_sign_in(user_data["token"])
-                    
-                    # 滚动更新昵称，每次将发送者昵称更新到用户数据中，确保昵称是最新的
-                    if user_id in str(users_data.get("umo")):
-                        # 当用户名不一致则更新
-                        if user_name != user_data.get("last_username"):
-                            await self.put_kv_data("users", {**(await self.get_kv_data("users", {})), user_id: {"last_username": nickname}})
-                    
-                    # 如果配置不显示玩家名称，或者昵称获取为空，则使用QQ昵称显示
-                    if nickname == None or nickname.strip() == "" or not self.config.get("show_player_name", True):
-                        nickname = user_data.get("last_username").strip() or "(未知)"
+
+                    # 同步发送者最新昵称（仅更新内存中的 user_data，循环结束后统一持久化）
+                    if user_name and user_name != user_data.get("last_username"):
+                        user_data["last_username"] = user_name
+
+                    # 配置不显示玩家名称或昵称缺失时回退到 QQ 昵称
+                    if not nickname or not nickname.strip() or not self.config.get("show_player_name", True):
+                        nickname = (user_data.get("last_username") or "").strip() or "(未知)"
                     
                     user_data["nickname"] = nickname
                     for r in results:
                         if r.game == "明日方舟" and self._is_signed_today(r):
-                            user_data.setdefault("last_sign", {})["arknights"] = datetime.now().strftime("%Y-%m-%d")
+                            self._mark_signed(user_data, "arknights")
                         elif r.game == "终末地" and self._is_signed_today(r):
-                            user_data.setdefault("last_sign", {})["endfield"] = datetime.now().strftime("%Y-%m-%d")
+                            self._mark_signed(user_data, "endfield")
                     
                     users_data[uid] = user_data
                     
-                    ak_icon = "✅" if user_data.get("last_sign", {}).get("arknights") else "❌"
-                    ef_icon = "✅" if user_data.get("last_sign", {}).get("endfield") else "❌"
+                    ak_icon = "✅" if self._signed_today(user_data, "arknights") else "❌"
+                    ef_icon = "✅" if self._signed_today(user_data, "endfield") else "❌"
                     message_lines.append(f" {ak_icon} | {ef_icon} | {nickname}")
-                except:
+                except Exception as e:
+                    logger.error(f"skd 查询用户 {uid} 失败: {e}")
                     message_lines.append(" ⚠️ | ⚠️ | (Error)")
             await self.put_kv_data("users", users_data)
             yield event.plain_result("\n".join(message_lines))

@@ -114,24 +114,19 @@ class SklandPlugin(Star):
                 token = user_data["token"]
                 results, nickname = await self.api.do_full_sign_in(token)
 
-                # 更新签到状态
-                for r in results:
-                    if r.game == "明日方舟" and self._is_signed_today(r):
-                        self._mark_signed(user_data, "arknights")
-                    elif r.game == "终末地" and self._is_signed_today(r):
-                        self._mark_signed(user_data, "endfield")
+                # 更新签到状态（按游戏聚合，全部角色已签才标记）
+                self._apply_sign_results(user_data, results)
 
                 # 构建消息
                 message = f"🎮 森空岛自动签到结果\n\n{self._format_sign_status(results, nickname)}"
                 await self._send_private_message(user_id, user_data, message)
-                users[user_id] = user_data
                 logger.info(f"用户 {user_id} ({nickname}) 自动签到完成")
             except Exception as e:
                 logger.error(f"用户 {user_id} 自动签到失败: {e}")
                 message = f"⚠️ 自动签到失败\n错误: {str(e)}\n请使用 /skdlogin 重新登录"
                 await self._send_private_message(user_id, user_data, message)
 
-        await self.put_kv_data("users", users)
+        await self._merge_users_patch(users)
         logger.info("自动签到执行完毕")
 
     async def _send_private_message(self, user_id: str, user_data: dict, message: str):
@@ -165,6 +160,31 @@ class SklandPlugin(Star):
     @staticmethod
     def _mark_signed(user_data: dict, game: str) -> None:
         user_data.setdefault("last_sign", {})[game] = datetime.now().strftime("%Y-%m-%d")
+
+    # 签到流程允许写回的用户字段；token/umo 等绑定字段不在此列，避免并发覆盖
+    _SIGN_MUTABLE_FIELDS = ("last_sign", "nickname", "last_username")
+    _GAME_KEY = {"明日方舟": "arknights", "终末地": "endfield"}
+
+    def _apply_sign_results(self, user_data: dict, results: list) -> None:
+        """按游戏聚合结果，该游戏全部角色都已签才标记，避免多角色部分失败被当作已签"""
+        by_game: dict = {}
+        for r in results:
+            by_game.setdefault(r.game, []).append(r)
+        for game, rs in by_game.items():
+            key = self._GAME_KEY.get(game)
+            if key and all(self._is_signed_today(r) for r in rs):
+                self._mark_signed(user_data, key)
+
+    async def _merge_users_patch(self, patch: dict) -> None:
+        """持久化前把字段级变更合并进最新 KV：不恢复已登出用户，不覆盖并发更新的绑定字段"""
+        latest = await self.get_kv_data("users", {})
+        for uid, user_data in patch.items():
+            if uid not in latest:
+                continue
+            for key in self._SIGN_MUTABLE_FIELDS:
+                if key in user_data:
+                    latest[uid][key] = user_data[key]
+        await self.put_kv_data("users", latest)
     def _format_sign_status(self, results: list, nickname: str = "") -> str:
         if not results:
             return "没有绑定游戏"
@@ -234,11 +254,7 @@ class SklandPlugin(Star):
                 "platform_name": event.get_platform_name(),
                 "umo": event.unified_msg_origin,  # 保存统一会话ID
             }
-            for r in results:
-                if r.game == "明日方舟" and self._is_signed_today(r):
-                    self._mark_signed(user_data, "arknights")
-                elif r.game == "终末地" and self._is_signed_today(r):
-                    self._mark_signed(user_data, "endfield")
+            self._apply_sign_results(user_data, results)
             await self.put_kv_data("users", {**(await self.get_kv_data("users", {})), user_id: user_data})
             yield event.plain_result(f"登录成功！\n{self._format_sign_status(results, nickname)}")
         except Exception as e:
@@ -345,37 +361,41 @@ class SklandPlugin(Star):
                 user_data = users_data.get(uid)
                 if not user_data:
                     continue
-                if self._signed_today(user_data, "arknights") and self._signed_today(user_data, "endfield"):
-                    nickname = user_data.get("nickname") or user_data.get("last_username") or "(未知)"
+                # 快速路径：仅当无需显示玩家名称或已有缓存玩家昵称时本地解析显示名，
+                # 缺缓存昵称时落入完整流程补全；显示时统一应用 QQ 昵称回退
+                both_signed = self._signed_today(user_data, "arknights") and self._signed_today(user_data, "endfield")
+                show_name = self.config.get("show_player_name", True)
+                cached = (user_data.get("nickname") or "").strip()
+                if both_signed and (cached or not show_name):
+                    if show_name:
+                        nickname = cached
+                    else:
+                        nickname = (user_data.get("last_username") or "").strip() or "(未知)"
                     message_lines.append(f" ✅ | ✅ | {nickname}")
                     continue
                 try:
                     results, nickname = await self.api.do_full_sign_in(user_data["token"])
 
-                    # 同步发送者最新昵称（仅更新内存中的 user_data，循环结束后统一持久化）
-                    if user_name and user_name != user_data.get("last_username"):
+                    # 同步发送者最新昵称（仅发送者本人记录，循环结束后统一合并持久化）
+                    if uid == user_id and user_name and user_name != user_data.get("last_username"):
                         user_data["last_username"] = user_name
 
-                    # 配置不显示玩家名称或昵称缺失时回退到 QQ 昵称
-                    if not nickname or not nickname.strip() or not self.config.get("show_player_name", True):
-                        nickname = (user_data.get("last_username") or "").strip() or "(未知)"
-                    
-                    user_data["nickname"] = nickname
-                    for r in results:
-                        if r.game == "明日方舟" and self._is_signed_today(r):
-                            self._mark_signed(user_data, "arknights")
-                        elif r.game == "终末地" and self._is_signed_today(r):
-                            self._mark_signed(user_data, "endfield")
-                    
+                    # 保存原始玩家昵称，显示时按配置回退 QQ 昵称
+                    user_data["nickname"] = (nickname or "").strip()
+                    display = user_data["nickname"]
+                    if not display or not self.config.get("show_player_name", True):
+                        display = (user_data.get("last_username") or "").strip() or "(未知)"
+
+                    self._apply_sign_results(user_data, results)
                     users_data[uid] = user_data
-                    
+
                     ak_icon = "✅" if self._signed_today(user_data, "arknights") else "❌"
                     ef_icon = "✅" if self._signed_today(user_data, "endfield") else "❌"
-                    message_lines.append(f" {ak_icon} | {ef_icon} | {nickname}")
+                    message_lines.append(f" {ak_icon} | {ef_icon} | {display}")
                 except Exception as e:
                     logger.error(f"skd 查询用户 {uid} 失败: {e}")
                     message_lines.append(" ⚠️ | ⚠️ | (Error)")
-            await self.put_kv_data("users", users_data)
+            await self._merge_users_patch(users_data)
             yield event.plain_result("\n".join(message_lines))
         else: # 私聊模式
             user_data = users_data.get(user_id)
@@ -384,6 +404,10 @@ class SklandPlugin(Star):
                 return
             try:
                 results, nickname = await self.api.do_full_sign_in(user_data["token"])
+                self._apply_sign_results(user_data, results)
+                if nickname:
+                    user_data["nickname"] = nickname.strip()
+                await self._merge_users_patch({user_id: user_data})
                 response = self._format_sign_status(results, nickname)
                 yield event.plain_result(response)
             except Exception as e:

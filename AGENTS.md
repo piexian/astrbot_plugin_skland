@@ -31,5 +31,6 @@ auto_sign_delay（随机延迟上限秒数）、max_users。代码内 fallback �
 - last_sign 存 `YYYY-MM-DD` 日期；判断是否已签必须与当天日期比较（见 `_signed_today`）
 - 持久化用 `get_kv_data` / `put_kv_data`（Star 的 KVStoreMixin）；更新用户数据只能整体覆盖同一 user dict，禁止用部分字段 dict 替换
 - 日志用 `from astrbot.api import logger`，不用 stdlib logging
-- 提交前如可用则运行 `ruff format` 与 `ruff check`
-- AstrBot API 以本地检出 /root/work/AstrBot 为准（audit baseline 4.26.6）
+- 不使用 `@register` 装饰器：4.29 起正式废弃，且 4 参调用会把 metadata.yaml 的 repo 覆盖为 None；插件类由 Star.__init_subclass__ 自动注册
+- 提交前如可用则运行 `ruff check`；不整体 `ruff format`（保持上游风格与最小 diff）
+- AstrBot API 以本地检出 /root/work/AstrBot 为准（4.29.1）；`astrbot.api.logger` 自 v4.26.8 引入，为兼容下限

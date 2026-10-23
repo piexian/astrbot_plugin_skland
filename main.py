@@ -21,16 +21,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter, MessageChain
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 import asyncio
 import random
 
 from .skland_api import SklandAPI
 
-PLUGIN_NAME = "astrbot_plugin_skland"
 
-
-@register(PLUGIN_NAME, "AstrBot", "森空岛自动签到插件", "1.4.1")
 class SklandPlugin(Star):
     """森空岛签到插件"""
 
